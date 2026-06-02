@@ -1,5 +1,5 @@
 name: "CarConnectivity Add-on"
-version: 0.7.7
+version: 0.7.8
 slug: "carconnectivity-addon"
 description: "CarConnectivity Add-on based on Till's project (https://github.com/tillsteinbach/CarConnectivity). May be unstable. MQTT required."
 image: "ghcr.io/feliciaan/carconnectivity-addon"
@@ -7,7 +7,6 @@ panel_icon: "mdi:car-wireless"
 map:
   - addon_config:rw
 arch:
-  - aarch64
   - amd64
 ingress: true
 init: false
