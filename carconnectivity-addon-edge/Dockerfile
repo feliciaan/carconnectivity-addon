@@ -38,7 +38,8 @@ RUN echo "ADDON_VERSION=v${BUILD_VERSION}" >> versions.txt && \
         carconnectivity-plugin-abrp==${ABRP_VERSION#v} \
         carconnectivity-plugin-mqtt==${MQTT_VERSION#v} \
         carconnectivity-plugin-webui==${WEBUI_VERSION#v} \
-        carconnectivity-plugin-mqtt_homeassistant==${MQTTHA_VERSION#v} && \
+        carconnectivity-plugin-mqtt_homeassistant==${MQTTHA_VERSION#v} \
+        git+https://github.com/mikrohard/CarConnectivity-connector-vw-eu-data-act.git && \
     /opt/venv/bin/pip install --no-cache --no-deps \
         carconnectivity-connector-audi==${AUDI_VERSION#v} \
         carconnectivity-connector-volkswagen_na==${VWNA_VERSION#v} && \
