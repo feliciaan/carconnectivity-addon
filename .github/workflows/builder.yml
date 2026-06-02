@@ -1,314 +1,123 @@
-name: Builder (Buildx Multi-Arch FINAL)
+name: Build add-on image
 
 on:
+  workflow_dispatch:
+    inputs:
+      addon:
+        description: Add-on directory
+        required: true
+        default: carconnectivity-addon
+
   workflow_call:
     inputs:
       addon:
         required: true
         type: string
-    outputs:
-      built:
-        description: "true if new images were built and pushed"
-        value: ${{ jobs.manifest.outputs.built }}
-
-  workflow_dispatch:
-    inputs:
-      addon:
-        description: "Addon directory"
-        required: false
-        type: string
 
 permissions:
   contents: read
   packages: write
-  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
 
 jobs:
-  # #############################################################
-  #  PREPARE — résolution addon + version + meta build (hors matrix)
-  # #############################################################
-  prepare:
+  build:
     runs-on: ubuntu-latest
-
-    outputs:
-      addon: ${{ steps.resolve.outputs.addon }}
-      version: ${{ steps.info.outputs.version }}
-      archs: ${{ steps.archs.outputs.archs }}
-      meta: ${{ steps.info.outputs.meta }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          ref: ${{ github.ref }}
-          sparse-checkout: |
-            ${{ github.event.inputs.addon || inputs.addon }}/config.yaml
-            ${{ github.event.inputs.addon || inputs.addon }}/build.yaml
 
-      - name: Resolve addon name
-        id: resolve
-        run: |
-          ADDON="${{ github.event.inputs.addon || inputs.addon }}"
-          echo "addon=$ADDON" >> $GITHUB_OUTPUT
-
-      - name: Read config.yaml (version + archs + build meta)
-        id: info
-        env:
-          ADDON: ${{ steps.resolve.outputs.addon }}
-        run: |
-          python3 - <<'EOF'
-          import yaml, json, os
-
-          addon = os.environ['ADDON']
-
-          with open(f'{addon}/config.yaml') as f:
-              config = yaml.safe_load(f)
-
-          version = str(config['version']).strip('"')
-          archs   = config['arch']
-
-          with open(f'{addon}/build.yaml') as f:
-              build = yaml.safe_load(f) or {}
-
-          meta = {}
-          for arch in archs:
-              bf = (build.get('build_from') or {}).get(arch)
-              if not bf:
-                  raise SystemExit(f"BUILD_FROM missing for {arch}")
-              # args -> liste de "K=V" (plus de jointure multi-lignes fragile)
-              args_list = [
-                  f"{k}={v}" for k, v in (build.get('args') or {}).items()
-              ]
-              meta[arch] = {"build_from": bf, "args": args_list}
-
-          gho = os.environ['GITHUB_OUTPUT']
-          with open(gho, 'a') as f:
-              f.write(f"version={version}\n")
-              f.write(f"archs={json.dumps(archs)}\n")
-              f.write(f"meta={json.dumps(meta)}\n")
-          EOF
-
-      # archs output is read by the matrix — expose it separately for clarity
-      - name: Re-export archs
-        id: archs
-        env:
-          ARCHS: ${{ steps.info.outputs.archs }}
-        run: echo "archs=$ARCHS" >> $GITHUB_OUTPUT
-
-  # #############################################################
-  #                       BUILD JOB
-  # #############################################################
-  build:
-    runs-on: ubuntu-latest
-    needs: prepare
-    strategy:
-      fail-fast: false 
-      matrix:
-        arch: ${{ fromJSON(needs.prepare.outputs.archs) }}
-
-    steps:
-      - name: Checkout (addon dir only)
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.ref }}
-          sparse-checkout: ${{ needs.prepare.outputs.addon }}
-
-      # ---------------------------------------------------------
-      # NORMALIZE ARCH: HA name → Docker platform name
-      # aarch64 → arm64, armv7 → arm/v7, amd64 → amd64
-      # ---------------------------------------------------------
-      - name: Normalize arch
-        id: norm
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          case "$ARCH" in
-            aarch64) echo "docker_platform=arm64" >> $GITHUB_OUTPUT ;;
-            armv7)   echo "docker_platform=arm/v7" >> $GITHUB_OUTPUT ;;
-            *)       echo "docker_platform=$ARCH" >> $GITHUB_OUTPUT ;;
-          esac
-
-      # ---------------------------------------------------------
-      # EXTRACT build meta from prepare outputs (no yq download)
-      # Construit directement le bloc build-args complet
-      # ---------------------------------------------------------
-      - name: Extract build meta
+      - name: Read add-on metadata
         id: meta
         env:
-          META: ${{ needs.prepare.outputs.meta }}
-          ARCH: ${{ matrix.arch }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          ADDON: ${{ inputs.addon || github.event.inputs.addon }}
+          OWNER: ${{ github.repository_owner }}
         run: |
-          set -euo pipefail
+          python3 - <<'PY'
+          import os, yaml, json
 
-          BUILD_FROM=$(echo "$META" | jq -r --arg a "$ARCH" '.[$a].build_from')
+          addon = os.environ["ADDON"]
+          owner = os.environ["OWNER"].lower()
 
-          if [ -z "$BUILD_FROM" ] || [ "$BUILD_FROM" = "null" ]; then
-            echo "::error::BUILD_FROM missing for $ARCH"
-            exit 1
-          fi
+          with open(f"{addon}/config.yaml") as f:
+              config = yaml.safe_load(f)
 
-          echo "build_from=$BUILD_FROM" >> "$GITHUB_OUTPUT"
+          with open(f"{addon}/build.yaml") as f:
+              build = yaml.safe_load(f) or {}
 
-          # Construit le bloc build-args COMPLET (les 3 obligatoires + les extras)
-          {
-            echo "build_args<<__EOF_ARGS__"
-            echo "BUILD_FROM=$BUILD_FROM"
-            echo "BUILD_VERSION=$VERSION"
-            echo "BUILD_ARCH=$ARCH"
-            # Extras : chaque entrée de .args[] est déjà "K=V"
-            echo "$META" | jq -r --arg a "$ARCH" '.[$a].args[]?'
-            echo "__EOF_ARGS__"
-          } >> "$GITHUB_OUTPUT"
+          version = str(config["version"]).strip('"')
+          archs = config["arch"]
 
-      # ---------------------------------------------------------
-      # SKIP BUILD if image already exists on Docker Hub
-      # ---------------------------------------------------------
-      - name: Check if image exists
-        id: exist
-        env:
-          ADDON: ${{ needs.prepare.outputs.addon }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          URL="https://hub.docker.com/v2/repositories/pulpyyyy/${ADDON}-${ARCH}/tags/${VERSION}/"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-          if [ "$STATUS" -eq 200 ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
+          platform_map = {
+              "amd64": "linux/amd64",
+              "aarch64": "linux/arm64",
+              "armv7": "linux/arm/v7",
+              "armhf": "linux/arm/v6",
+              "i386": "linux/386",
+          }
 
-      # ---------------------------------------------------------
-      # BUILDX & LOGIN
-      # ---------------------------------------------------------
-      - name: Setup QEMU
-        if: steps.exist.outputs.exists == 'false'
+          platforms = [platform_map[a] for a in archs]
+
+          # For a true multi-arch build, all arches should use compatible BUILD_FROM.
+          # We pass BUILD_FROM from the first arch, which is fine for many HA base images.
+          build_from = (build.get("build_from") or {}).get(archs[0])
+          if not build_from:
+              raise SystemExit(f"Missing build_from for {archs[0]}")
+
+          args = {
+              "BUILD_FROM": build_from,
+              "BUILD_VERSION": version,
+              "BUILD_ARCH": archs[0],
+              **(build.get("args") or {}),
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"addon={addon}\n")
+              out.write(f"owner={owner}\n")
+              out.write(f"version={version}\n")
+              out.write(f"platforms={','.join(platforms)}\n")
+              out.write("build_args<<EOF\n")
+              for k, v in args.items():
+                  out.write(f"{k}={v}\n")
+              out.write("EOF\n")
+          PY
+
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
-      - name: Setup Buildx
-        if: steps.exist.outputs.exists == 'false'
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Login to Docker Hub
-        if: steps.exist.outputs.exists == 'false'
+      - name: Login to GHCR
         uses: docker/login-action@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---------------------------------------------------------
-      # BUILD PAR ARCH
-      # ---------------------------------------------------------
-      - name: Build image (per arch)
-        if: steps.exist.outputs.exists == 'false'
+      - name: Generate Docker metadata
+        id: docker_meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ steps.meta.outputs.owner }}/${{ steps.meta.outputs.addon }}
+          tags: |
+            type=raw,value=${{ steps.meta.outputs.version }}
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and push multi-arch image
         uses: docker/build-push-action@v7
         with:
-          context: ./${{ needs.prepare.outputs.addon }}
-          platforms: linux/${{ steps.norm.outputs.docker_platform }}
+          context: ./${{ steps.meta.outputs.addon }}
+          platforms: ${{ steps.meta.outputs.platforms }}
           push: true
-
-          tags: |
-            pulpyyyy/${{ needs.prepare.outputs.addon }}-${{ matrix.arch }}:${{ needs.prepare.outputs.version }}
-            pulpyyyy/${{ needs.prepare.outputs.addon }}-${{ matrix.arch }}:latest
-            ${{ matrix.arch == 'aarch64' && format('pulpyyyy/{0}-arm64:{1}', needs.prepare.outputs.addon, needs.prepare.outputs.version) || '' }}
-            ${{ matrix.arch == 'aarch64' && format('pulpyyyy/{0}-arm64:latest', needs.prepare.outputs.addon) || '' }}
-
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
           build-args: ${{ steps.meta.outputs.build_args }}
-
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           provenance: false
           sbom: false
-
-          cache-from: type=registry,ref=pulpyyyy/${{ needs.prepare.outputs.addon }}-${{ matrix.arch }}:latest
-          cache-to: type=inline
-
-  # #############################################################
-  #                     MANIFEST JOB
-  # #############################################################
-  manifest:
-    runs-on: ubuntu-latest
-    needs: [prepare, build]
-
-    outputs:
-      built: ${{ steps.result.outputs.built }}
-
-    steps:
-      - name: Login Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Setup Buildx
-        uses: docker/setup-buildx-action@v4
-
-      # ---------------------------------------------------------
-      # VÉRIFICATION que les images arch sont bien disponibles
-      # ---------------------------------------------------------
-      - name: Check arch images exist
-        env:
-          ADDON: ${{ needs.prepare.outputs.addon }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          ARCHS: ${{ needs.prepare.outputs.archs }}
-        run: |
-          for ARCH in $(echo "$ARCHS" | jq -r '.[]'); do
-            URL="https://hub.docker.com/v2/repositories/pulpyyyy/${ADDON}-${ARCH}/tags/${VERSION}/"
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-            if [ "$STATUS" -ne 200 ]; then
-              echo "::error::Image pulpyyyy/${ADDON}-${ARCH}:${VERSION} not found (HTTP $STATUS)"
-              exit 1
-            fi
-            echo "OK pulpyyyy/${ADDON}-${ARCH}:${VERSION} exists"
-          done
-
-      # ---------------------------------------------------------
-      # SKIP VERSION MANIFEST IF ALREADY EXISTS
-      # ---------------------------------------------------------
-      - name: Check if VERSION manifest exists
-        id: manifestcheck
-        env:
-          ADDON: ${{ needs.prepare.outputs.addon }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          URL="https://hub.docker.com/v2/repositories/pulpyyyy/${ADDON}/tags/${VERSION}/"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-          if [ "$STATUS" -eq 200 ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Manifest ${VERSION} already exists, skipping."
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Manifest ${VERSION} missing, will create it."
-          fi
-
-      - name: Set built output
-        id: result
-        env:
-          EXISTS: ${{ steps.manifestcheck.outputs.exists }}
-        run: |
-          if [ "$EXISTS" = "false" ]; then
-            echo "built=true" >> $GITHUB_OUTPUT
-          else
-            echo "built=false" >> $GITHUB_OUTPUT
-          fi
-
-      # ---------------------------------------------------------
-      # MULTI-ARCH MANIFEST (version)
-      # ---------------------------------------------------------
-      - name: Create VERSION manifest
-        if: steps.manifestcheck.outputs.exists == 'false'
-        env:
-          ADDON: ${{ needs.prepare.outputs.addon }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          ARCHS: ${{ needs.prepare.outputs.archs }}
-        run: |
-          SOURCES=$(echo "$ARCHS" | jq -r --arg addon "$ADDON" --arg ver "$VERSION" '.[] | "pulpyyyy/\($addon)-\(.):\($ver)"')
-          docker buildx imagetools create --tag pulpyyyy/$ADDON:$VERSION $SOURCES
-
-      # LATEST est toujours mis à jour, indépendamment du check VERSION
-      - name: Create LATEST manifest
-        env:
-          ADDON: ${{ needs.prepare.outputs.addon }}
-          ARCHS: ${{ needs.prepare.outputs.archs }}
-        run: |
-          SOURCES=$(echo "$ARCHS" | jq -r --arg addon "$ADDON" '.[] | "pulpyyyy/\($addon)-\(.):latest"')
-          docker buildx imagetools create --tag pulpyyyy/$ADDON:latest $SOURCES
