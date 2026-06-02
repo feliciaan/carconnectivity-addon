@@ -116,7 +116,10 @@ jobs:
           push: true
           tags: ${{ steps.docker_meta.outputs.tags }}
           labels: ${{ steps.docker_meta.outputs.labels }}
-          build-args: ${{ steps.meta.outputs.build_args }}
+          build-args: |
+            ${{ steps.meta.outputs.build_args }}
+            BUILD_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
